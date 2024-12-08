@@ -128,29 +128,76 @@ struct AutoResizableText: View {
 }
 
 
-func compareImages(image1: CGImage, image2: CGImage) -> Bool {
-    let ciImage1 = CIImage(cgImage: image1)
-    let ciImage2 = CIImage(cgImage: image2)
+// https://gist.github.com/nicolas-miari/519cb8fd31c16e5daac263412996d08a
+
+enum ImageDiffError: LocalizedError {
+  case failedToCreateFilter
+  case failedToCreateContext
+}
+
+func compareImages(_ leftImage: CGImage, _ rightImage: CGImage) throws -> Bool {
+    let left = CIImage(cgImage: leftImage)
+    let right = CIImage(cgImage: rightImage)
     
-    let diffFilter = CIFilter(name: "CIDifferenceBlendMode")!
-    diffFilter.setValue(ciImage1, forKey: kCIInputImageKey)
-    diffFilter.setValue(ciImage2, forKey: kCIInputBackgroundImageKey)
+    guard let diffFilter = CIFilter(name: "CIDifferenceBlendMode") else {
+        throw ImageDiffError.failedToCreateFilter
+    }
+    diffFilter.setDefaults()
+    diffFilter.setValue(left, forKey: kCIInputImageKey)
+    diffFilter.setValue(right, forKey: kCIInputBackgroundImageKey)
     
-    let areaMaxFilter = CIFilter(name: "CIAreaMaximum")!
-    areaMaxFilter.setValue(diffFilter.outputImage, forKey: kCIInputImageKey)
+    // Create the area max filter and set its properties.
+    guard let areaMaxFilter = CIFilter(name: "CIAreaMaximum") else {
+        throw ImageDiffError.failedToCreateFilter
+    }
+    areaMaxFilter.setDefaults()
+    areaMaxFilter.setValue(diffFilter.value(forKey: kCIOutputImageKey),
+                           forKey: kCIInputImageKey)
+    let compareRect = CGRect(x: 0, y: 0, width: CGFloat(leftImage.width), height: CGFloat(leftImage.height))
     
-    let context = CIContext()
-    var pixelBuffer = [UInt8](repeating: 0, count: 4)
-    context.render(
-        areaMaxFilter.outputImage!,
-        toBitmap: &pixelBuffer,
-        rowBytes: 4,
-        bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
-        format: .RGBA8,
-        colorSpace: nil
-    )
+    let extents = CIVector(cgRect: compareRect)
+    areaMaxFilter.setValue(extents, forKey: kCIInputExtentKey)
     
-    return pixelBuffer[0] == 0 && pixelBuffer[1] == 0 && pixelBuffer[2] == 0
+    // The filters have been setup, now set up the CGContext bitmap context the
+    // output is drawn to. Setup the context with our supplied buffer.
+    let alphaInfo = CGImageAlphaInfo.premultipliedLast
+    let bitmapInfo = CGBitmapInfo(rawValue: alphaInfo.rawValue)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    
+    var buf: [CUnsignedChar] = Array<CUnsignedChar>(repeating: 255, count: 16)
+    
+    guard let context = CGContext(
+        data: &buf,
+        width: 1,
+        height: 1,
+        bitsPerComponent: 8,
+        bytesPerRow: 16,
+        space: colorSpace,
+        bitmapInfo: bitmapInfo.rawValue
+    ) else {
+        throw ImageDiffError.failedToCreateContext
+    }
+    
+    // Now create the core image context CIContext from the bitmap context.
+    let ciContextOpts = [
+        CIContextOption.workingColorSpace : colorSpace,
+        CIContextOption.useSoftwareRenderer : false
+    ] as [CIContextOption : Any]
+    let ciContext = CIContext(cgContext: context, options: ciContextOpts)
+    
+    // Get the output CIImage and draw that to the Core Image context.
+    let valueImage = areaMaxFilter.value(forKey: kCIOutputImageKey)! as! CIImage
+    ciContext.draw(valueImage, in: CGRect(x: 0, y: 0, width: 1, height: 1),
+                   from: valueImage.extent)
+    
+    // This will have modified the contents of the buffer used for the CGContext.
+    // Find the maximum value of the different color components. Remember that
+    // the CGContext was created with a Premultiplied last meaning that alpha
+    // is the fourth component with red, green and blue in the first three.
+    let maxVal = max(buf[0], max(buf[1], buf[2]))
+    let diff = Int(maxVal)
+    
+    return diff < 20
 }
 
 func getLineHeight(fontSize: CGFloat) -> CGFloat {
@@ -223,7 +270,7 @@ struct OverlayView: View {
                 let (image, scaleFactor) = try! await captureImageAsync()!;
                 
                 if let lastImageV = lastImage {
-                    if compareImages(image1: lastImageV, image2: image) {
+                    if try! compareImages(lastImageV, image) {
                         return;
                     }
                 }
